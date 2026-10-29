@@ -44,7 +44,7 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      - name: Patch NDK 27, Fix Zombie Detector & OpenVPN Classpath
+      - name: Patch NDK, Fix Classes & Disable Aggressive Failover
         run: |
           python3 - << 'PYEOF'
           import glob, os, re, shutil, zipfile
@@ -121,19 +121,15 @@ jobs:
               with open(app_bg, "w", encoding="utf-8") as f:
                   f.write(abg)
 
-          # 4. FIX ZOMBIE DETECTOR in vpn_controller.dart (Use Cloudflare/Google instead of ip-api)
+          # 4. NEUTER ZOMBIE DETECTOR (Stop Auto-Disconnect Loop)
           vpn_ctrl = "lib/controllers/vpn_controller.dart"
           if os.path.exists(vpn_ctrl):
               with open(vpn_ctrl, "r", encoding="utf-8") as f:
                   ctrl_code = f.read()
-              # Replace ip-api check URL with cloudflare/google
-              ctrl_code = ctrl_code.replace("http://ip-api.com/json", "https://1.1.1.1/cdn-cgi/trace")
-              ctrl_code = ctrl_code.replace("https://ip-api.com/json", "https://1.1.1.1/cdn-cgi/trace")
-              # Relax timeout to 8 seconds
-              ctrl_code = re.sub(r'Duration\(seconds:\s*\d+\)', 'Duration(seconds: 8)', ctrl_code)
+              # Override the internet check to always return true, so it trusts the connection
+              ctrl_code = re.sub(r'Future<bool>\s+checkInternet.*?\s+{', 'Future<bool> checkInternet() async { return true; /* bypassed */', ctrl_code, flags=re.DOTALL)
               with open(vpn_ctrl, "w", encoding="utf-8") as f:
                   f.write(ctrl_code)
-              print("Patched vpn_controller.dart with reliable Cloudflare trace endpoint")
           PYEOF
 
       - name: Build Release APK
