@@ -30,7 +30,7 @@ jobs:
           flutter-version: '3.27.4'
           channel: 'stable'
 
-      - name: Fill missing Android binary files & Fix JVM Target
+      - name: Fill missing Android binary files & Fix Gradle/Kotlin Classpath
         run: |
           flutter create --org com.egy.vpn /tmp/template_app
           mkdir -p android/gradle/wrapper
@@ -40,6 +40,24 @@ jobs:
           chmod +x android/gradlew
           echo "" >> android/gradle.properties
           echo "kotlin.jvm.target.validation.mode=warning" >> android/gradle.properties
+          cat << 'EOF' >> android/build.gradle
+
+          gradle.projectsEvaluated {
+              def appProj = rootProject.findProject(':app')
+              def ovpnProj = rootProject.findProject(':openvpn_flutter')
+              if (appProj != null) {
+                  appProj.android.ndkVersion = "27.0.12077973"
+              }
+              if (appProj != null && ovpnProj != null) {
+                  appProj.tasks.matching { it.name.startsWith("compile") && it.name.endsWith("Kotlin") }.configureEach { ktTask ->
+                      def conf = ovpnProj.configurations.findByName("releaseCompileClasspath")
+                      if (conf != null) {
+                          ktTask.libraries.from(conf)
+                      }
+                  }
+              }
+          }
+          EOF
 
       - name: Install dependencies
         run: flutter pub get
