@@ -44,7 +44,7 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      - name: Patch NDK 27 & OpenVPN Supertypes Classpath
+      - name: Patch NDK 27, Fix Zombie Detector & OpenVPN Classpath
         run: |
           python3 - << 'PYEOF'
           import glob, os, re, shutil, zipfile
@@ -53,7 +53,7 @@ jobs:
           libs_dir = "android/app/libs"
           os.makedirs(libs_dir, exist_ok=True)
 
-          # 1. Extract classes.jar from any .aar or copy .jar inside openvpn_flutter so Kotlin resolves de.blinkt.openvpn
+          # 1. Fix OpenVPN classes
           idx = 0
           for root, _, files in os.walk(pub_cache):
               if "openvpn_flutter" not in root:
@@ -68,22 +68,19 @@ jobs:
                                   out_jar = os.path.join(libs_dir, f"ovpn_dep_{idx}.jar")
                                   with z.open(member) as src, open(out_jar, "wb") as dst:
                                       shutil.copyfileobj(src, dst)
-                                  print(f"Extracted {member} from {f} -> {out_jar}")
                   elif f.endswith(".jar") and "gradle" not in f:
                       idx += 1
                       out_jar = os.path.join(libs_dir, f"ovpn_jar_{idx}.jar")
                       shutil.copy2(full, out_jar)
 
-          # 2. Change maven/project 'implementation' to 'api' in openvpn_flutter build.gradle
           for bg in glob.glob(f"{pub_cache}/hosted/pub.dev/openvpn_flutter-*/android/build.gradle"):
               with open(bg, "r", encoding="utf-8") as f:
                   txt = f.read()
               txt = re.sub(r'\bimplementation(\s+project\b|\s+[\'"][^\'"]+[\'"])', r'api\1', txt)
               with open(bg, "w", encoding="utf-8") as f:
                   f.write(txt)
-              print(f"Updated dependencies to api in {bg}")
 
-          # 3. Patch MainActivity.kt to call OpenVPNFlutterPlugin via Reflection
+          # 2. Patch MainActivity.kt with Reflection
           main_kt = "android/app/src/main/kotlin/com/egy/vpn/MainActivity.kt"
           if os.path.exists(main_kt):
               with open(main_kt, "r", encoding="utf-8") as f:
@@ -105,9 +102,8 @@ jobs:
                   code = code + "\n" + shim
                   with open(main_kt, "w", encoding="utf-8") as f:
                       f.write(code)
-                  print("Patched MainActivity.kt with reflection shim")
 
-          # 4. Patch android/app/build.gradle for NDK 27 and compileOnly libs
+          # 3. Patch android/app/build.gradle for NDK 27
           app_bg = "android/app/build.gradle"
           if os.path.exists(app_bg):
               with open(app_bg, "r", encoding="utf-8") as f:
@@ -124,7 +120,20 @@ jobs:
                   abg += '\ndependencies {\n    compileOnly fileTree(dir: "libs", include: ["*.jar"])\n}\n'
               with open(app_bg, "w", encoding="utf-8") as f:
                   f.write(abg)
-              print("Patched android/app/build.gradle successfully")
+
+          # 4. FIX ZOMBIE DETECTOR in vpn_controller.dart (Use Cloudflare/Google instead of ip-api)
+          vpn_ctrl = "lib/controllers/vpn_controller.dart"
+          if os.path.exists(vpn_ctrl):
+              with open(vpn_ctrl, "r", encoding="utf-8") as f:
+                  ctrl_code = f.read()
+              # Replace ip-api check URL with cloudflare/google
+              ctrl_code = ctrl_code.replace("http://ip-api.com/json", "https://1.1.1.1/cdn-cgi/trace")
+              ctrl_code = ctrl_code.replace("https://ip-api.com/json", "https://1.1.1.1/cdn-cgi/trace")
+              # Relax timeout to 8 seconds
+              ctrl_code = re.sub(r'Duration\(seconds:\s*\d+\)', 'Duration(seconds: 8)', ctrl_code)
+              with open(vpn_ctrl, "w", encoding="utf-8") as f:
+                  f.write(ctrl_code)
+              print("Patched vpn_controller.dart with reliable Cloudflare trace endpoint")
           PYEOF
 
       - name: Build Release APK
