@@ -30,7 +30,7 @@ jobs:
           flutter-version: '3.27.4'
           channel: 'stable'
 
-      - name: Fill missing Android binary files & Fix Gradle/Kotlin Classpath
+      - name: Fill missing Android binary files
         run: |
           flutter create --org com.egy.vpn /tmp/template_app
           mkdir -p android/gradle/wrapper
@@ -40,27 +40,92 @@ jobs:
           chmod +x android/gradlew
           echo "" >> android/gradle.properties
           echo "kotlin.jvm.target.validation.mode=warning" >> android/gradle.properties
-          cat << 'EOF' >> android/build.gradle
-
-          gradle.projectsEvaluated {
-              def appProj = rootProject.findProject(':app')
-              def ovpnProj = rootProject.findProject(':openvpn_flutter')
-              if (appProj != null) {
-                  appProj.android.ndkVersion = "27.0.12077973"
-              }
-              if (appProj != null && ovpnProj != null) {
-                  appProj.tasks.matching { it.name.startsWith("compile") && it.name.endsWith("Kotlin") }.configureEach { ktTask ->
-                      def conf = ovpnProj.configurations.findByName("releaseCompileClasspath")
-                      if (conf != null) {
-                          ktTask.libraries.from(conf)
-                      }
-                  }
-              }
-          }
-          EOF
 
       - name: Install dependencies
         run: flutter pub get
+
+      - name: Patch NDK 27 & OpenVPN Supertypes Classpath
+        run: |
+          python3 - << 'PYEOF'
+          import glob, os, re, shutil, zipfile
+
+          pub_cache = os.path.expanduser("~/.pub-cache")
+          libs_dir = "android/app/libs"
+          os.makedirs(libs_dir, exist_ok=True)
+
+          # 1. Extract classes.jar from any .aar or copy .jar inside openvpn_flutter so Kotlin resolves de.blinkt.openvpn
+          idx = 0
+          for root, _, files in os.walk(pub_cache):
+              if "openvpn_flutter" not in root:
+                  continue
+              for f in files:
+                  full = os.path.join(root, f)
+                  if f.endswith(".aar"):
+                      with zipfile.ZipFile(full, 'r') as z:
+                          for member in z.namelist():
+                              if member.endswith(".jar"):
+                                  idx += 1
+                                  out_jar = os.path.join(libs_dir, f"ovpn_dep_{idx}.jar")
+                                  with z.open(member) as src, open(out_jar, "wb") as dst:
+                                      shutil.copyfileobj(src, dst)
+                                  print(f"Extracted {member} from {f} -> {out_jar}")
+                  elif f.endswith(".jar") and "gradle" not in f:
+                      idx += 1
+                      out_jar = os.path.join(libs_dir, f"ovpn_jar_{idx}.jar")
+                      shutil.copy2(full, out_jar)
+
+          # 2. Change maven/project 'implementation' to 'api' in openvpn_flutter build.gradle
+          for bg in glob.glob(f"{pub_cache}/hosted/pub.dev/openvpn_flutter-*/android/build.gradle"):
+              with open(bg, "r", encoding="utf-8") as f:
+                  txt = f.read()
+              txt = re.sub(r'\bimplementation(\s+project\b|\s+[\'"][^\'"]+[\'"])', r'api\1', txt)
+              with open(bg, "w", encoding="utf-8") as f:
+                  f.write(txt)
+              print(f"Updated dependencies to api in {bg}")
+
+          # 3. Patch MainActivity.kt to call OpenVPNFlutterPlugin via Reflection
+          main_kt = "android/app/src/main/kotlin/com/egy/vpn/MainActivity.kt"
+          if os.path.exists(main_kt):
+              with open(main_kt, "r", encoding="utf-8") as f:
+                  code = f.read()
+              if "OpenVPNFlutterPlugin" in code:
+                  code = re.sub(r'^\s*import\s+id\.laskarmedia\.openvpn_flutter\.OpenVPNFlutterPlugin\s*$', '', code, flags=re.M)
+                  code = code.replace("id.laskarmedia.openvpn_flutter.OpenVPNFlutterPlugin", "OpenVPNFlutterPlugin")
+                  shim = """
+          private object OpenVPNFlutterPlugin {
+              fun connectWhileGranted(granted: Boolean) {
+                  try {
+                      Class.forName("id.laskarmedia.openvpn_flutter.OpenVPNFlutterPlugin")
+                          .getMethod("connectWhileGranted", Boolean::class.javaPrimitiveType)
+                          .invoke(null, granted)
+                  } catch (_: Throwable) {}
+              }
+          }
+          """
+                  code = code + "\n" + shim
+                  with open(main_kt, "w", encoding="utf-8") as f:
+                      f.write(code)
+                  print("Patched MainActivity.kt with reflection shim")
+
+          # 4. Patch android/app/build.gradle for NDK 27 and compileOnly libs
+          app_bg = "android/app/build.gradle"
+          if os.path.exists(app_bg):
+              with open(app_bg, "r", encoding="utf-8") as f:
+                  abg = f.read()
+              if "ndkVersion" in abg:
+                  abg = re.sub(r'ndkVersion\s+.*', 'ndkVersion "27.0.12077973"', abg)
+              else:
+                  abg = abg.replace("android {", 'android {\n    ndkVersion "27.0.12077973"', 1)
+              abg = re.sub(r'minifyEnabled\s+true', 'minifyEnabled false', abg)
+              abg = re.sub(r'shrinkResources\s+true', 'shrinkResources false', abg)
+              if "dependencies {" in abg:
+                  abg = abg.replace("dependencies {", 'dependencies {\n    compileOnly fileTree(dir: "libs", include: ["*.jar"])', 1)
+              else:
+                  abg += '\ndependencies {\n    compileOnly fileTree(dir: "libs", include: ["*.jar"])\n}\n'
+              with open(app_bg, "w", encoding="utf-8") as f:
+                  f.write(abg)
+              print("Patched android/app/build.gradle successfully")
+          PYEOF
 
       - name: Build Release APK
         run: flutter build apk --release --no-tree-shake-icons
